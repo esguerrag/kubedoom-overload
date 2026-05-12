@@ -93,19 +93,15 @@ EOF
     BG_PIDS="$BG_PIDS $!"
 
 elif [ "$BACKEND" = "x11" ]; then
-    echo "[entrypoint] Using X11 backend (Xvfb + x11vnc)"
+    echo "[entrypoint] Using X11 backend (TigerVNC)"
 
-    echo "[entrypoint] Starting Xvfb ..."
-    Xvfb :99 -ac -screen 0 "${RESOLUTION}x24" &
+    echo "[entrypoint] Starting TigerVNC (Xvnc) on port ${VNC_PORT} ..."
+    nohup Xtigervnc :99 -geometry "${RESOLUTION}" -depth 32 -rfbport "${VNC_PORT}" -localhost no -SecurityTypes None > /tmp/xvnc.log 2>&1 &
     BG_PIDS="$!"
     sleep 2
 
-    echo "[entrypoint] Starting x11vnc on port ${VNC_PORT} ..."
-    x11vnc -geometry "${RESOLUTION}" -forever -usepw -display :99 -rfbport "${VNC_PORT}" &
-    BG_PIDS="$BG_PIDS $!"
-
     echo "[entrypoint] Starting psdoom ..."
-    DISPLAY=:99 /usr/local/games/psdoom -warp -E1M1 -skill 1 -nomouse &
+    DISPLAY=:99 nohup /usr/local/games/psdoom -warp -E1M1 -skill 1 -nomouse > /tmp/psdoom.log 2>&1 &
     BG_PIDS="$BG_PIDS $!"
 
 else
@@ -116,6 +112,9 @@ fi
 # Remove the EXIT trap so that normal exec does not kill the children we just
 # launched.  After exec the Go binary becomes PID 1 and handles signals itself.
 trap - EXIT
+
+# Disown all background jobs so they survive this shell's exit.
+disown -a
 
 # Replace this shell with the kubedoom binary.
 exec /usr/bin/kubedoom "$@"
