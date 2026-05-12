@@ -16,14 +16,49 @@ spec:
       labels:
         app: kubedoom
     spec:
-      hostNetwork: true
       serviceAccountName: kubedoom
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - image: ghcr.io/storax/kubedoom:latest
+        - name: kubedoom
+          image: localhost/kubedoom:latest
+          imagePullPolicy: Never
           env:
             - name: NAMESPACE
               value: default
-          name: kubedoom
           ports:
             - containerPort: 5900
               name: vnc
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command:
+                - test
+                - -S
+                - /tmp/dockerdoom.socket
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - test
+                - -S
+                - /tmp/dockerdoom.socket
+            initialDelaySeconds: 5
+            periodSeconds: 5
