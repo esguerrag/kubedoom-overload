@@ -1,0 +1,39 @@
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# Kubernetes manifests — not needed inside the image
+manifest/
+
+# Documentation
+*.md
+WAYLAND_RESEARCH.md
+
+# Test files — not needed for the build
+kubedoom_test.go
+
+# Scripts not used by the image
+wayland-poc.sh
+
+# Local cluster config
+kind-config.yaml
+
+# Image assets
+assets/
+
+# Go build artifacts (if built locally)
+kubedoom
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,14 +1,24 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"log"
+	"log/slog"
 	"net"
 	"os"
-	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 )
 
 func hash(input string) int32 {
@@ -23,88 +33,98 @@ func hash(input string) int32 {
 	return hash
 }
 
-func runCmd(cmdstring string) {
-	parts := strings.Split(cmdstring, " ")
-	cmd := exec.Command(parts[0], parts[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		log.Fatalf("The following command failed: \"%v\"\n", cmdstring)
+func buildKubeConfig() (*rest.Config, error) {
+	if cfg, err := rest.InClusterConfig(); err == nil {
+		return cfg, nil
 	}
-}
-
-func outputCmd(argv []string) string {
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stderr = os.Stderr
-	output, err := cmd.Output()
-	if err != nil {
-		log.Fatalf("The following command failed: \"%v\"\n", argv)
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		if home := homedir.HomeDir(); home != "" {
+			kubeconfig = filepath.Join(home, ".kube", "config")
+		}
 	}
-	return string(output)
-}
-
-func startCmd(cmdstring string) {
-	parts := strings.Split(cmdstring, " ")
-	cmd := exec.Command(parts[0], parts[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	err := cmd.Start()
-	if err != nil {
-		log.Fatalf("The following command failed: \"%v\"\n", cmdstring)
-	}
+	return clientcmd.BuildConfigFromFlags("", kubeconfig)
 }
 
 type Mode interface {
-	getEntities() []string
-	deleteEntity(string)
+	getEntities(ctx context.Context) []string
+	deleteEntity(ctx context.Context, entity string)
 }
 
 type podmode struct {
+	clientset       *kubernetes.Clientset
+	namespace       string
+	filterNamespace bool
 }
 
-func (m podmode) getEntities() []string {
-	var args []string
-	if namespace, exists := os.LookupEnv("NAMESPACE"); exists {
-		args = []string{"kubectl", "get", "pods", "--namespace", namespace, "-o", "go-template", "--template={{range .items}}{{.metadata.namespace}}/{{.metadata.name}} {{end}}"}
+func (m podmode) getEntities(ctx context.Context) []string {
+	var list *corev1.PodList
+	var err error
+	if m.filterNamespace {
+		list, err = m.clientset.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{})
 	} else {
-		args = []string{"kubectl", "get", "pods", "-A", "-o", "go-template", "--template={{range .items}}{{.metadata.namespace}}/{{.metadata.name}} {{end}}"}
+		list, err = m.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	}
-	output := outputCmd(args)
-	outputstr := strings.TrimSpace(output)
-	pods := strings.Split(outputstr, " ")
+	if err != nil {
+		slog.Error("failed to list pods", "error", err)
+		return []string{}
+	}
+	pods := make([]string, 0, len(list.Items))
+	for _, pod := range list.Items {
+		pods = append(pods, pod.Namespace+"/"+pod.Name)
+	}
 	return pods
 }
 
-func (m podmode) deleteEntity(entity string) {
-	log.Printf("Pod to kill: %v", entity)
+func (m podmode) deleteEntity(ctx context.Context, entity string) {
+	slog.Info("Pod to kill", "entity", entity)
 	podparts := strings.Split(entity, "/")
-	cmd := exec.Command("/usr/bin/kubectl", "delete", "pod", "-n", podparts[0], podparts[1])
-	go cmd.Run()
+	if len(podparts) != 2 {
+		slog.Error("invalid pod entity", "entity", entity)
+		return
+	}
+	go func() {
+		err := m.clientset.CoreV1().Pods(podparts[0]).Delete(context.Background(), podparts[1], metav1.DeleteOptions{})
+		if err != nil {
+			slog.Error("failed to delete pod", "namespace", podparts[0], "name", podparts[1], "error", err)
+		}
+	}()
 }
 
 type nsmode struct {
+	clientset *kubernetes.Clientset
 }
 
-func (m nsmode) getEntities() []string {
-	args := []string{"kubectl", "get", "namespaces", "-o", "go-template", "--template={{range .items}}{{.metadata.name}} {{end}}"}
-	output := outputCmd(args)
-	outputstr := strings.TrimSpace(output)
-	namespaces := strings.Split(outputstr, " ")
+func (m nsmode) getEntities(ctx context.Context) []string {
+	list, err := m.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		slog.Error("failed to list namespaces", "error", err)
+		return []string{}
+	}
+	namespaces := make([]string, 0, len(list.Items))
+	for _, ns := range list.Items {
+		namespaces = append(namespaces, ns.Name)
+	}
 	return namespaces
 }
 
-func (m nsmode) deleteEntity(entity string) {
-	log.Printf("Namespace to kill: %v", entity)
-	cmd := exec.Command("/usr/bin/kubectl", "delete", "namespace", entity)
-	go cmd.Run()
+func (m nsmode) deleteEntity(ctx context.Context, entity string) {
+	slog.Info("Namespace to kill", "entity", entity)
+	go func() {
+		err := m.clientset.CoreV1().Namespaces().Delete(context.Background(), entity, metav1.DeleteOptions{})
+		if err != nil {
+			slog.Error("failed to delete namespace", "name", entity, "error", err)
+		}
+	}()
 }
 
 func socketLoop(listener net.Listener, mode Mode) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
 			panic(err)
 		}
 		stop := false
@@ -116,13 +136,14 @@ func socketLoop(listener net.Listener, mode Mode) {
 			}
 			bytes = bytes[0:n]
 			strbytes := strings.TrimSpace(string(bytes))
-			entities := mode.getEntities()
+			entities := mode.getEntities(context.Background())
 			if strbytes == "list" {
 				for _, entity := range entities {
 					padding := strings.Repeat("\n", 255-len(entity))
 					_, err = conn.Write([]byte(entity + padding))
 					if err != nil {
-						log.Fatal("Could not write to socker file")
+						slog.Error("Could not write to socket file", "error", err)
+						os.Exit(1)
 					}
 				}
 				conn.Close()
@@ -131,11 +152,12 @@ func socketLoop(listener net.Listener, mode Mode) {
 				parts := strings.Split(strbytes, " ")
 				killhash, err := strconv.ParseInt(parts[1], 10, 32)
 				if err != nil {
-					log.Fatal("Could not parse kill hash")
+					slog.Error("Could not parse kill hash", "error", err)
+					os.Exit(1)
 				}
 				for _, entity := range entities {
 					if hash(entity) == int32(killhash) {
-						mode.deleteEntity(entity)
+						mode.deleteEntity(context.Background(), entity)
 						break
 					}
 				}
@@ -152,28 +174,44 @@ func main() {
 
 	flag.Parse()
 
+	config, err := buildKubeConfig()
+	if err != nil {
+		slog.Error("failed to build kubeconfig", "error", err)
+		os.Exit(1)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		slog.Error("failed to create clientset", "error", err)
+		os.Exit(1)
+	}
+
 	var mode Mode
 	switch modeFlag {
 	case "pods":
-		mode = podmode{}
+		ns, nsSet := os.LookupEnv("NAMESPACE")
+		mode = podmode{clientset: clientset, namespace: ns, filterNamespace: nsSet}
 	case "namespaces":
-		mode = nsmode{}
+		mode = nsmode{clientset: clientset}
 	default:
-		log.Fatalf("Mode should be pods or namespaces")
+		slog.Error("Mode should be pods or namespaces")
+		os.Exit(1)
 	}
 
-	listener, err := net.Listen("unix", "/dockerdoom.socket")
+	listener, err := net.Listen("unix", "/tmp/dockerdoom.socket")
 	if err != nil {
-		log.Fatalf("Could not create socket file")
+		slog.Error("Could not create socket file", "error", err)
+		os.Exit(1)
 	}
 
-	log.Print("Create virtual display")
-	startCmd("/usr/bin/Xvfb :99 -ac -screen 0 640x480x24")
-	time.Sleep(time.Duration(2) * time.Second)
-	startCmd("x11vnc -geometry 640x480 -forever -usepw -display :99")
-	log.Print("You can now connect to it with a VNC viewer at port 5900")
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Print("Trying to start DOOM ...")
-	startCmd("/usr/bin/env DISPLAY=:99 /usr/local/games/psdoom -warp -E1M1 -skill 1 -nomouse")
-	socketLoop(listener, mode)
+	slog.Info("KubeDoom socket server started", "socket", "/tmp/dockerdoom.socket")
+
+	go socketLoop(listener, mode)
+
+	<-sigCh
+	slog.Info("Shutting down...")
+	listener.Close()
+	time.Sleep(2 * time.Second)
 }
