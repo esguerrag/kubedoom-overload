@@ -64,7 +64,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       --no-install-recommends \
       ca-certificates \
       libsdl-mixer1.2 libsdl-net1.2 \
-      x11vnc xvfb \
+      netcat-openbsd \
+      tigervnc-standalone-server tigervnc-tools \
       sway xwayland wayvnc \
       libpixman-1-0 libwayland-client0 libxkbcommon0
 
@@ -77,9 +78,11 @@ RUN sed -i 's/^UID_MAX[[:space:]]*.*/UID_MAX\t\t65536/' /etc/login.defs && \
     groupadd -g 65532 kubedoom && \
     useradd -l -u 65532 -g kubedoom -s /bin/sh -m kubedoom && \
     mkdir -p /home/kubedoom/.vnc && \
-    x11vnc -storepasswd "${VNCPASSWORD}" /home/kubedoom/.vnc/passwd && \
+    printf '%s\n' "${VNCPASSWORD}" | vncpasswd -f > /home/kubedoom/.vnc/passwd && \
+    chmod 600 /home/kubedoom/.vnc/passwd && \
     chown -R kubedoom:kubedoom /home/kubedoom/.vnc && \
-    chgrp kubedoom / && chmod 775 /
+    chgrp kubedoom / && chmod 775 / && \
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 # Copy binaries and assets from previous stages.
 # COPY --link allows these layers to be cached independently of the previous
